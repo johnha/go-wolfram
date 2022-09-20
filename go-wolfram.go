@@ -8,11 +8,25 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+
+	"github.com/pkg/errors"
+
+	jsonIter "github.com/json-iterator/go"
 )
 
-//The client, requires an App ID, which you can sign up for at https://developer.wolframalpha.com/
+/*
+	See the following for detail on the API:
+
+	https://products.wolframalpha.com/api/documentation
+*/
+
+// Client requires an App ID, which you can sign up for at https://developer.wolframalpha.com/
 type Client struct {
 	AppID string
+}
+
+type Query struct {
+	Result QueryResult `json:"queryresult"`
 }
 
 //The QueryResult is what you get back after a request
@@ -20,7 +34,7 @@ type QueryResult struct {
 	Query string
 
 	//The pods are what hold the majority of the information
-	Pods []Pod `json:"pod"`
+	Pods []Pod `json:"pods"`
 
 	//Warnings hold information about for example spelling errors
 	Warnings Warnings `json:"warnings"`
@@ -28,25 +42,27 @@ type QueryResult struct {
 	//Assumptions show info if some assumption was made while parsing the query
 	Assumptions Assumptions `json:"assumptions"`
 
-	//Each Source contains a link to a web page with the source information
-	Sources Sources `json:"sources"`
+	// Each Source contains a link to a web page with the source information.
+	//  johnha: removed this from interpretation.  This is a single object when only 1, otherwise an array.   We need 1 or
+	//	the other to unmarshall so will ignore.
+	// Sources []Source `json:"sources"`
 
 	//Generalizes the query to display more information
 	Generalizations []Generalization `json:"generalization"`
 
 	//true or false depending on whether the input could be successfully
 	//understood. If false there will be no <pod> subelements
-	Success string `json:"success"`
+	Success bool `json:"success"`
 
 	//true or false depending on whether a serious processing error occurred,
 	//such as a missing required parameter. If true there will be no pod
 	//content, just an <error> sub-element.
-	Error string `json:"error"`
+	Error bool `json:"error"`
 
 	//The number of pod elements
 	NumPods int `json:"numpods"`
 
-	//Categories and types of data represented in the results
+	//Categories and types of data represented in the results (comma separated list)
 	DataTypes string `json:"datatypes"`
 
 	//The number of pods that are missing because they timed out (see the
@@ -61,7 +77,7 @@ type QueryResult struct {
 
 	//Whether the parsing stage timed out (try a longer parsetimeout parameter
 	//if true)
-	ParseTimedOut string `json:"parsetimedout"`
+	ParseTimedOut bool `json:"parsetimedout"`
 
 	//A URL to use to recalculate the query and get more pods.
 	ReCalculate string `json:"recalculate"`
@@ -69,7 +85,7 @@ type QueryResult struct {
 	//These elements are not documented currently
 	ID      string `json:"id"`
 	Host    string `json:"host"`
-	Server  int    `json:"server"`
+	Server  string `json:"server"`
 	Related string `json:"related"`
 
 	//The version specification of the API on the server that produced this result.
@@ -150,14 +166,17 @@ type Value struct {
 	Input       string `json:"input"`
 }
 
-//<pod> elements are subelements of <queryresult>. Each contains the results for a single pod
+// Pod elements are sub-elements of <queryresult>. Each contains the results for a single pod
 type Pod struct {
 	//The subpod elements of the pod
-	SubPods []SubPod `json:"subpod"`
+	SubPods []SubPod `json:"subpods"`
 
-	//sub elements of the pod
-	Infos  Infos  `json:"infos"`
-	States States `json:"states"`
+	// Infos  []Info  `json:"infos"`	// johnha: api denotes a 'count' property, but missing in actual response (has object with property 'units' for example when looking up UK)
+
+	// states will contain alternative states for the pod (shown as buttons on the wolfram detailed response).  An example is to request more population detail for example.   The state has
+	//	a name (that can be displayed as a button), and an 'input'.   This 'input' key can be specified as the 'podstate' parameter.  This field is not URL encoded and will be required to URL
+	//	encode if you want to obtain this detail.
+	States []State `json:"states"`
 
 	//The pod title, used to identify the pod.
 	Title string `json:"title"`
@@ -167,14 +186,21 @@ type Pod struct {
 	Scanner string `json:"scanner"`
 
 	//Marks the pod that displays the closest thing to a simple "answer" that Wolfram|Alpha can provide
-	Primary    bool   `json:"primary,omitempty"`
+	// Primary bool `json:"primary,omitempty"`
 
-	//Not documented currently
-	ID         string `json:"id"`
-	Position   int    `json:"position"`
-	Error      string `json:"error"`
-	NumSubPods int    `json:"numsubpods"`
-	Sounds     Sounds `json:"sounds"`
+	// true or false depending on whether a serious processing error occurred with this specific pod. If true, there will be an <error> subelement
+	Error bool `json:"error"`
+
+	// A number indicating the intended position of the pod in a visual display. These numbers are typically multiples of 100, and they form an increasing sequence from top to bottom.
+	Position int `json:"position"`
+
+	// A unique identifier for a pod, used for selecting specific pods to include or exclude.
+	ID string `json:"id"`
+
+	//  The number of subpod elements present.
+	NumSubPods int `json:"numsubpods"`
+
+	// Sounds     Sounds `json:"sounds"`
 }
 
 //If there was a sound related to the query, if you for example query a musical note
@@ -187,13 +213,6 @@ type Sounds struct {
 type Sound struct {
 	URL  string `json:"url"`
 	Type string `json:"type"`
-}
-
-//If there's extra information for the pod, the pod will have a <infos> element
-//which contains <info> elements with text, and/or images/links to that information
-type Infos struct {
-	Count int    `json:"count"`
-	Info  []Info `json:"info"`
 }
 
 type Info struct {
@@ -219,18 +238,12 @@ type Source struct {
 	Text string `json:"text"`
 }
 
-//"Many pods on the Wolfram|Alpha website have text buttons in their upper-right corners that substitute the
-//contents of that pod with a modified version. In Figure 1, the Result pod has buttons titled "More days", "Sun and
-//Moon", CDT", "GMT", and "Show metric". Clicking any of these buttons will recompute just that one pod to display
-//different information."
-type States struct {
-	Count int     `json:"count"`
-	State []State `json:"state"`
-}
-
+// State denotes a refinement of pod detail.  A query will result in pods that have have more detail (states) that can be
+//	refined.  The 'name' is the button on wolfram alpha.  The 'input' is a non-url encoded value that can be specified as
+//	a podstate prop in additional request (so will need url encoding).
 type State struct {
 	Name  string `json:"name"`
-	Input string `json:"input"`
+	Input string `json:"input"` // n.b the 'podstate' prop and non URL endoded to refine detail for a pod.
 }
 
 type SubPod struct {
@@ -244,12 +257,24 @@ type SubPod struct {
 	Title string `json:"title"`
 }
 
+/*
+	HTML <img> elements suitable for direct inclusion in a webpage. They point to stored image files giving a formatted visual representation of a single subpod.
+	They only appear in pods if the requested result formats include img. In most cases, the image will be in GIF format, although in a few cases it will be in
+	JPEG format. The filename in the <img> URL will tell you whether it is GIF or JPEG. The <img> tag also contains the following attributes:
+
+	src — The exact URL of the image being displayed, to be used for displaying the image.
+	alt — Alternate text to display in case the image does not render correctly—usually the same as the <plaintext> representation of the image.
+	title — Descriptive title for internal identification of an image—usually the same as the <plaintext> representation of the image.
+	width — The width of the image in pixels; can be changed using the width control parameters.
+	height: — The height of the image in pixels; scales depending on width setting.
+*/
 type Img struct {
-	Src    string `json:"src"`
-	Alt    string `json:"alt"`
-	Title  string `json:"title"`
-	Width  int    `json:"width"`
-	Height int    `json:"height"`
+	Src         string `json:"src"`
+	Alt         string `json:"alt"`
+	Title       string `json:"title"`
+	Width       int    `json:"width"`
+	Height      int    `json:"height"`
+	ContentType string `json:"contenttype"`
 }
 
 // GetQueryResult gets the query result from the API and returns it.
@@ -266,15 +291,24 @@ func (c *Client) GetQueryResult(query string, params url.Values) (*QueryResult, 
 		url += "&" + params.Encode()
 	}
 
-	data := &QueryResult{}
-	data.Query = query
 	res, err := http.Get(url)
 	if err != nil {
-		return nil, err
+		return nil, errors.WithMessage(err, "error in wolfram alpha http request")
 	}
-	err = unmarshal(res, data)
 
-	return data, err
+	body, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return nil, errors.WithMessage(err, "error in obtaining full wolfram alpha http result")
+	}
+
+	data := &Query{}
+	data.Result.Query = query
+
+	if err = jsonIter.Unmarshal(body, &data); err != nil {
+		return nil, errors.WithMessage(err, "unable to interpret wolfram alpha json result")
+	}
+
+	return &data.Result, err
 }
 
 // Gets the json from the API and assigns the data to the target.
@@ -403,7 +437,9 @@ func (c *Client) GetFastQueryRecognizer(query string, mode Mode) (*FastQueryResu
 		query += "&mode=Voice"
 	}
 
-	query = fmt.Sprintf("https://www.wolframalpha.com/queryrecognizer/query.jsp?appid=%s&i=%s&output=json", c.AppID, query)
+	query = fmt.Sprintf(
+		"https://www.wolframalpha.com/queryrecognizer/query.jsp?appid=%s&i=%s&output=json", c.AppID, query,
+	)
 
 	res, err := http.Get(query)
 	if err != nil {
