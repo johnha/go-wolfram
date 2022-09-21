@@ -1,6 +1,7 @@
 package wolfram
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,9 +11,12 @@ import (
 	"strconv"
 
 	"github.com/pkg/errors"
+	"github.com/valyala/fasttemplate"
 
 	jsonIter "github.com/json-iterator/go"
 )
+
+var jsonLib = jsonIter.ConfigCompatibleWithStandardLibrary
 
 /*
 	See the following for detail on the API:
@@ -145,23 +149,151 @@ type Alternative struct {
 	InnerText string `json:",innerxml"`
 }
 
+/*
+	example query for 'dow chemical'
+
+   "assumptions": {
+       "type": "Clash",
+       "word": "dow chemical",
+       "template": "Assuming \"${word}\" is ${desc1}. Use as ${desc2} instead",
+       "count": 2,
+       "values": [
+           {
+               "name": "Financial",
+               "desc": "a financial entity",
+               "input": "*C.dow+chemical-_*Financial-"
+           },
+           {
+               "name": "Company",
+               "desc": "a company",
+               "input": "*C.dow+chemical-_*Company-"
+           }
+       ]
+   },
+*/
+
+// Assumptions list assumptions made in query result, typically about the meaning of a query or phrase.
 type Assumptions struct {
 	Assumption []Assumption `json:"assumption"`
 	Count      int          `json:"count"`
 }
 
+// UnmarshalJSON for assumptions.   Issue with the response from WA in that if a single assumption then an object is returned
+//	containing the single assumption detail.   This appears to be a configuration with Ajax java library.   Questionable design
+//	but we work around by performing the check.
+//  see: https://www.calhoun.io/how-to-parse-json-that-varies-between-an-array-or-a-single-item-with-go/
+func (a *Assumptions) UnmarshalJSON(data []byte) error {
+
+	if len(data) == 0 {
+		return errors.New("no bytes in assumptions to unmarshall")
+	}
+
+	fmt.Printf("\n\n^^^^^^^^\n ******* \nassumptions: %s\n\n", string(data))
+
+	// determine whether object or array and unmarshall appropriately.   Note that go json unmarshaller should have removed
+	//	the leading spaces and this should be ok (will fail otherwise).
+	switch data[0] {
+	case '{':
+		fmt.Printf("\n\nassumptions (object: %s\n\n", string(data))
+		// unmarshal single assumption
+		a.Count = 1
+		a.Assumption = make([]Assumption, 1)
+		return json.Unmarshal(data, &a.Assumption[0])
+
+	case '[':
+		fmt.Printf("\n\nassumptions (array: %s\n\n", string(data))
+
+		if err := jsonLib.Unmarshal(data, &a.Assumption); err != nil {
+			return errors.WithMessage(err, "error interpreting assumption")
+		} else {
+			a.Count = len(a.Assumption)
+		}
+
+	default:
+		return errors.Errorf("assumptions json does not indicate an object or array (%s)", string(data[0]))
+	}
+	return nil
+}
+
 type Assumption struct {
-	Values   []Value `json:"value"`
-	Type     string  `json:"type"`
-	Word     string  `json:"word"`
-	Template string  `json:"template"`
+	Values   []Value `json:"values"`   // alternate values and actions to refine on request
+	Type     string  `json:"type"`     // classification of an assumption that defines how it will function
+	Word     string  `json:"word"`     // the central word/phrase to which the assumption is applied
+	Template string  `json:"template"` // statement outlining the way an assumption will be applied
 	Count    int     `json:"count"`
 }
 
-//Usually contains info about an assumption
+/* ForActionDisplay will return a display representation of the assumption with associated action.
+
+	See https://products.wolframalpha.com/api/documentation for detail RE the API
+
+e.g.
+	{
+		"type":"Clash",
+		"word":"dow chemical",
+		"template":"Assuming \"${word}\" is ${desc1}. Use as ${desc2} instead",
+		"count":2,
+		"values":[
+			{
+				"name":"Financial",
+				"desc":"a financial entity",
+				"input":"*C.dow+chemical-_*Financial-"
+			},
+			{
+				"name":"Company",
+				"desc":"a company",
+				"input":"*C.dow+chemical-_*Company-"
+			}
+		]
+	}
+
+	to display:  Assuming "dow chemical" is a financial entity | Use as a company instead
+*/
+
+// ActionAssumption represents an assumption that can be displayed and acted upon (switch meaning)
+type ActionAssumption struct {
+	Label       string
+	Action      string // the string to append to request with prop assumption
+	ButtonLabel string // the name to use as a button label
+	Description string // description (e.g. as Movie)
+}
+
+// ForActionDisplay will return a display representation of the assumption with associated action.
+func (assumption *Assumption) ForActionDisplay() (*[]ActionAssumption, error) {
+	if len(assumption.Values) < 2 {
+		// the first element of the assumption list is the one applied.   There has to be >1 for it to be an assumption
+		return nil, errors.New("nothing to assume")
+	}
+	actions := make([]ActionAssumption, 0, len(assumption.Values)-1)
+	assumedValue := assumption.Values[0].Description
+
+	template := fasttemplate.New(assumption.Template, "${", "}")
+
+	for _, value := range assumption.Values[1:] {
+		var displayAssumption ActionAssumption
+		// replace ${word} with assumption word, and ${desc1} and ${desc2}.   desc1 being the assumed value (first element)
+		//	and desc2 being the current proposed value.
+		label := template.ExecuteString(
+			map[string]interface{}{
+				"word":  assumption.Word,
+				"desc1": assumedValue,
+				"desc2": value.Description,
+			},
+		)
+
+		displayAssumption.Label = label
+		displayAssumption.Action = value.Input
+		displayAssumption.ButtonLabel = value.Name
+		displayAssumption.Description = value.Description
+		actions = append(actions, displayAssumption)
+	}
+
+	return &actions, nil
+}
+
+// Value contains info about an assumption
 type Value struct {
 	Name        string `json:"name"`
-	Word        string `json:"word"`
 	Description string `json:"desc"`
 	Input       string `json:"input"`
 }
@@ -301,10 +433,14 @@ func (c *Client) GetQueryResult(query string, params url.Values) (*QueryResult, 
 		return nil, errors.WithMessage(err, "error in obtaining full wolfram alpha http result")
 	}
 
+	// todo: remove json dump of result
+	jsonResult, _ := PrettyJsonFromRaw((*json.RawMessage)(&body))
+	fmt.Printf("*********\nGetQueryResult JSON\n%s\n", jsonResult)
+
 	data := &Query{}
 	data.Result.Query = query
 
-	if err = jsonIter.Unmarshal(body, &data); err != nil {
+	if err = jsonLib.Unmarshal(body, &data); err != nil {
 		return nil, errors.WithMessage(err, "unable to interpret wolfram alpha json result")
 	}
 
@@ -377,7 +513,7 @@ func (c *Client) GetShortAnswerQuery(query string, units Unit, timeout int) (str
 	return string(b), nil
 }
 
-func (c *Client) GetSpokentAnswerQuery(query string, units Unit, timeout int) (string, error) {
+func (c *Client) GetSpokenAnswerQuery(query string, units Unit, timeout int) (string, error) {
 	query = url.QueryEscape(query)
 
 	switch units {
@@ -452,4 +588,13 @@ func (c *Client) GetFastQueryRecognizer(query string, mode Mode) (*FastQueryResu
 		return nil, err
 	}
 	return qres, nil
+}
+
+// PrettyJsonFromRaw returns a formatted JSON string from raw JSON value
+func PrettyJsonFromRaw(bJson *json.RawMessage) (string, error) {
+	var prettyJSON bytes.Buffer
+	if err := json.Indent(&prettyJSON, *bJson, "", "    "); err != nil {
+		return "", err
+	}
+	return prettyJSON.String(), nil
 }
