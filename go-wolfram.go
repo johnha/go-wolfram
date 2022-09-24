@@ -58,10 +58,8 @@ type QueryResult struct {
 	//understood. If false there will be no <pod> subelements
 	Success bool `json:"success"`
 
-	//true or false depending on whether a serious processing error occurred,
-	//such as a missing required parameter. If true there will be no pod
-	//content, just an <error> sub-element.
-	Error bool `json:"error"`
+	// If no error, this will be false.  If an error, this is an object with a code and description
+	Error QueryError `json:"error"`
 
 	//The number of pod elements
 	NumPods int `json:"numpods"`
@@ -147,6 +145,42 @@ type ReInterpretation struct {
 
 type Alternative struct {
 	InnerText string `json:",innerxml"`
+}
+
+// QueryError denotes an error returned by the server.  Note that Wolfram returns a boolean if no error, and a structure
+//	containing description and code if an error.  We therefore need to marshall appropriately.
+type QueryError struct {
+	Err error // nil if no error, a message if error
+}
+
+func (qe *QueryError) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 {
+		return errors.New("no bytes in error to unmarshall")
+	}
+
+	// determine whether object or array and unmarshall appropriately.   Note that go json unmarshaller should have removed
+	//	the leading spaces and this should be ok (will fail otherwise).
+	switch data[0] {
+	case '{':
+		// this is an object that denotes an error
+		reportedError := struct {
+			Code string `json:"code"`
+			Msg  string `json:"msg"`
+		}{}
+		if err := json.Unmarshal(data, &reportedError); err != nil {
+			return errors.WithMessage(err, "unable to interpret error response")
+		}
+		qe.Err = errors.Errorf("error in Wolfram Alpha request, %s (code %s)", reportedError.Msg, reportedError.Code)
+
+	default:
+		// otherwise this expected to be text true/false.  I would assume always true if not an object, but will check and report
+		if string(data) == "false" {
+			qe.Err = nil
+		} else {
+			qe.Err = errors.Errorf("Wolfram Alpha reported failure with no error detail (%d)", string(data))
+		}
+	}
+	return nil
 }
 
 /*
