@@ -366,6 +366,9 @@ type Pod struct {
 	//  The number of subpod elements present.
 	NumSubPods int `json:"numsubpods"`
 
+	// List of definitions useful for interpreting the result
+	Definitions DefinitionList `json:"definitions"`
+
 	// Sounds     Sounds `json:"sounds"`
 }
 
@@ -391,6 +394,50 @@ type Link struct {
 	URL   string `json:"url"`
 	Text  string `json:"text"`
 	Title string `json:"title"`
+}
+
+/*
+	todo: the WA interface is pretty poor at standardising the responses for Json.
+*/
+
+type DefinitionList []Definition
+
+// Definition defines terms that are useful for interpreting the result
+type Definition struct {
+	Word string `json:"word"`
+	Desc string `json:"desc"`
+}
+
+// UnmarshalJSON is a list of terms useful for interpreting results.  When there is 1 in the list then an object is returned
+//	otherwise a list.   A bespoke unmarshall is therefore required.   This is truelly aweful, and must be a better way
+//	of implementing this (todo)
+func (d *DefinitionList) UnmarshalJSON(data []byte) error {
+
+	fmt.Printf("\n\n** DEFINITION: %s\n\n", string(data))
+
+	if len(data) == 4 && string(data) == "null" {
+		return nil
+	}
+
+	for _, b := range data {
+		switch b {
+		// These are the only valid whitespace in a JSON object.
+		case ' ', '\n', '\r', '\t':
+		case '[':
+			return json.Unmarshal(data, (*[]Definition)(d))
+		case '{':
+			var obj Definition
+			if err := json.Unmarshal(data, &obj); err != nil {
+				return err
+			}
+			*d = []Definition{obj}
+			return nil
+		default:
+			return errors.New("definitions must be object or list")
+		}
+	}
+	return errors.New("definitions must be object or list")
+	return nil
 }
 
 //Each Source contains a link to a web page with the source information
