@@ -18,6 +18,36 @@ import (
 
 var jsonLib = jsonIter.ConfigCompatibleWithStandardLibrary
 
+// unmarshalObjectOrList decodes JSON that is either one T object or a []T.
+// Wolfram Alpha frequently emits a bare object when a collection has length 1.
+func unmarshalObjectOrList[T any](data []byte, dest *[]T, field string) error {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || string(data) == "null" {
+		return nil
+	}
+	for _, b := range data {
+		switch b {
+		case ' ', '\n', '\r', '\t':
+			continue
+		case '[':
+			if err := jsonLib.Unmarshal(data, dest); err != nil {
+				return errors.WithMessagef(err, "decode %s list", field)
+			}
+			return nil
+		case '{':
+			var one T
+			if err := jsonLib.Unmarshal(data, &one); err != nil {
+				return errors.WithMessagef(err, "decode single %s object", field)
+			}
+			*dest = []T{one}
+			return nil
+		default:
+			return errors.Errorf("%s must be object or list (got %q)", field, string(b))
+		}
+	}
+	return errors.Errorf("%s must be object or list", field)
+}
+
 /*
 	See the following for detail on the API:
 
@@ -51,8 +81,8 @@ type QueryResult struct {
 	//	the other to unmarshall so will ignore.
 	// Sources []Source `json:"sources"`
 
-	//Generalizes the query to display more information
-	Generalizations []Generalization `json:"generalization"`
+	// Generalizes the query to display more information (object or list).
+	Generalizations GeneralizationList `json:"generalization"`
 
 	//true or false depending on whether the input could be successfully
 	//understood. If false there will be no <pod> subelements
@@ -101,6 +131,15 @@ type Generalization struct {
 	Topic       string `json:"topic"`
 	Description string `json:"desc"`
 	URL         string `json:"url"`
+	ID          string `json:"id"`
+}
+
+// GeneralizationList is object-or-list (WA returns one object when count==1).
+type GeneralizationList []Generalization
+
+// UnmarshalJSON accepts a single generalization object or an array.
+func (g *GeneralizationList) UnmarshalJSON(data []byte) error {
+	return unmarshalObjectOrList(data, (*[]Generalization)(g), "generalization")
 }
 
 type Warnings struct {
@@ -181,7 +220,7 @@ func (qe *QueryError) UnmarshalJSON(data []byte) error {
 		if string(data) == "false" {
 			qe.Err = nil
 		} else {
-			qe.Err = errors.Errorf("Wolfram Alpha reported failure with no error detail (%d)", string(data))
+			qe.Err = errors.Errorf("Wolfram Alpha reported failure with no error detail (%s)", string(data))
 		}
 	}
 	return nil
@@ -222,31 +261,39 @@ type Assumptions struct {
 //		but we work around by performing the check.
 //	 see: https://www.calhoun.io/how-to-parse-json-that-varies-between-an-array-or-a-single-item-with-go/
 func (a *Assumptions) UnmarshalJSON(data []byte) error {
-
-	if len(data) == 0 {
-		return errors.New("no bytes in assumptions to unmarshall")
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || string(data) == "null" {
+		return nil
 	}
 
-	fmt.Printf("\n\n^^^^^^^^\n ******* \nassumptions: %s\n\n", string(data))
-
-	// determine whether object or array and unmarshall appropriately.   Note that go json unmarshaller should have removed
-	//	the leading spaces and this should be ok (will fail otherwise).
+	// determine whether object or array and unmarshall appropriately.
 	switch data[0] {
 	case '{':
-		fmt.Printf("\n\nassumptions (object: %s\n\n", string(data))
-		// unmarshal single assumption
+		// Single assumption object OR full Assumptions envelope {count, assumption}.
+		var probe map[string]json.RawMessage
+		if err := jsonLib.Unmarshal(data, &probe); err != nil {
+			return err
+		}
+		if raw, ok := probe["assumption"]; ok {
+			// Envelope with nested assumption (object or list).
+			var list []Assumption
+			if err := unmarshalObjectOrList(raw, &list, "assumption"); err != nil {
+				return err
+			}
+			a.Assumption = list
+			a.Count = len(list)
+			return nil
+		}
+		// Bare single Assumption object.
 		a.Count = 1
 		a.Assumption = make([]Assumption, 1)
-		return json.Unmarshal(data, &a.Assumption[0])
+		return jsonLib.Unmarshal(data, &a.Assumption[0])
 
 	case '[':
-		fmt.Printf("\n\nassumptions (array: %s\n\n", string(data))
-
 		if err := jsonLib.Unmarshal(data, &a.Assumption); err != nil {
 			return errors.WithMessage(err, "error interpreting assumption")
-		} else {
-			a.Count = len(a.Assumption)
 		}
+		a.Count = len(a.Assumption)
 
 	default:
 		return errors.Errorf("assumptions json does not indicate an object or array (%s)", string(data[0]))
@@ -418,27 +465,7 @@ type Definition struct {
 //	otherwise a list.   A bespoke unmarshall is therefore required.   This is truelly aweful, and must be a better way
 //	of implementing this (todo)
 func (d *DefinitionList) UnmarshalJSON(data []byte) error {
-	if len(data) == 4 && string(data) == "null" {
-		return nil
-	}
-
-	for _, b := range data {
-		switch b {
-		case ' ', '\n', '\r', '\t':
-		case '[':
-			return json.Unmarshal(data, (*[]Definition)(d))
-		case '{':
-			var obj Definition
-			if err := json.Unmarshal(data, &obj); err != nil {
-				return err
-			}
-			*d = []Definition{obj}
-			return nil
-		default:
-			return errors.New("definitions must be object or list")
-		}
-	}
-	return errors.New("definitions must be object or list")
+	return unmarshalObjectOrList(data, (*[]Definition)(d), "definitions")
 }
 
 // DidYouMeanList holds alternative query suggestions when Success is false.
@@ -453,26 +480,7 @@ type DidYouMean struct {
 
 // UnmarshalJSON accepts a single object or a list (WA returns either shape).
 func (d *DidYouMeanList) UnmarshalJSON(data []byte) error {
-	if len(data) == 4 && string(data) == "null" {
-		return nil
-	}
-	for _, b := range data {
-		switch b {
-		case ' ', '\n', '\r', '\t':
-		case '[':
-			return json.Unmarshal(data, (*[]DidYouMean)(d))
-		case '{':
-			var obj DidYouMean
-			if err := json.Unmarshal(data, &obj); err != nil {
-				return err
-			}
-			*d = []DidYouMean{obj}
-			return nil
-		default:
-			return errors.New("didyoumeans must be object or list")
-		}
-	}
-	return errors.New("didyoumeans must be object or list")
+	return unmarshalObjectOrList(data, (*[]DidYouMean)(d), "didyoumeans")
 }
 
 // Each Source contains a link to a web page with the source information
