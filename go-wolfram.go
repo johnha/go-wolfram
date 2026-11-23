@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/pkg/errors"
 	"github.com/valyala/fasttemplate"
@@ -59,6 +60,9 @@ type QueryResult struct {
 
 	// If no error, this will be false.  If an error, this is an object with a code and description
 	Error QueryError `json:"error"`
+
+	// DidYouMeans are alternative interpretations when Success is false (object or list).
+	DidYouMeans DidYouMeanList `json:"didyoumeans"`
 
 	//The number of pod elements
 	NumPods int `json:"numpods"`
@@ -414,16 +418,12 @@ type Definition struct {
 //	otherwise a list.   A bespoke unmarshall is therefore required.   This is truelly aweful, and must be a better way
 //	of implementing this (todo)
 func (d *DefinitionList) UnmarshalJSON(data []byte) error {
-
-	fmt.Printf("\n\n** DEFINITION: %s\n\n", string(data))
-
 	if len(data) == 4 && string(data) == "null" {
 		return nil
 	}
 
 	for _, b := range data {
 		switch b {
-		// These are the only valid whitespace in a JSON object.
 		case ' ', '\n', '\r', '\t':
 		case '[':
 			return json.Unmarshal(data, (*[]Definition)(d))
@@ -439,7 +439,40 @@ func (d *DefinitionList) UnmarshalJSON(data []byte) error {
 		}
 	}
 	return errors.New("definitions must be object or list")
-	return nil
+}
+
+// DidYouMeanList holds alternative query suggestions when Success is false.
+type DidYouMeanList []DidYouMean
+
+// DidYouMean is a single alternative interpretation from Wolfram Alpha.
+type DidYouMean struct {
+	Score string `json:"score"`
+	Level string `json:"level"`
+	Val   string `json:"val"`
+}
+
+// UnmarshalJSON accepts a single object or a list (WA returns either shape).
+func (d *DidYouMeanList) UnmarshalJSON(data []byte) error {
+	if len(data) == 4 && string(data) == "null" {
+		return nil
+	}
+	for _, b := range data {
+		switch b {
+		case ' ', '\n', '\r', '\t':
+		case '[':
+			return json.Unmarshal(data, (*[]DidYouMean)(d))
+		case '{':
+			var obj DidYouMean
+			if err := json.Unmarshal(data, &obj); err != nil {
+				return err
+			}
+			*d = []DidYouMean{obj}
+			return nil
+		default:
+			return errors.New("didyoumeans must be object or list")
+		}
+	}
+	return errors.New("didyoumeans must be object or list")
 }
 
 // Each Source contains a link to a web page with the source information
@@ -500,14 +533,29 @@ type Img struct {
 // Additional information about parameters can be found at
 // http://products.wolframalpha.com/docs/WolframAlpha-API-Reference.pdf, page 42
 func (c *Client) GetQueryResult(query string, params url.Values) (*QueryResult, error) {
-	query = url.QueryEscape(query)
-
-	url := fmt.Sprintf("https://api.wolframalpha.com/v2/query?input=%s&appid=%s&output=JSON", query, c.AppID)
-	if params != nil {
-		url += "&" + params.Encode()
+	if strings.TrimSpace(c.AppID) == "" {
+		return nil, errors.New("wolfram alpha AppID is empty")
+	}
+	if strings.Contains(c.AppID, "{{") || strings.Contains(c.AppID, "}}") {
+		return nil, errors.New("wolfram alpha AppID looks like an unexpanded placeholder")
 	}
 
-	res, err := http.Get(url)
+	// Build the request with url.Values so spaces are encoded once (as + / %20),
+	// avoiding brittle hand-built query strings.
+	q := make(url.Values)
+	q.Set("input", query)
+	q.Set("appid", c.AppID)
+	q.Set("output", "JSON")
+	if params != nil {
+		for k, vs := range params {
+			for _, v := range vs {
+				q.Add(k, v)
+			}
+		}
+	}
+	reqURL := "https://api.wolframalpha.com/v2/query?" + q.Encode()
+
+	res, err := http.Get(reqURL)
 	if err != nil {
 		return nil, errors.WithMessage(err, "error in wolfram alpha http request")
 	}
@@ -518,14 +566,42 @@ func (c *Client) GetQueryResult(query string, params url.Values) (*QueryResult, 
 		return nil, errors.WithMessage(err, "error in obtaining full wolfram alpha http result")
 	}
 
-	data := &Query{}
-	data.Result.Query = query
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		// API often returns {"status":401,"message":"Invalid appid"} without queryresult.
+		var apiErr struct {
+			Status  int    `json:"status"`
+			Message string `json:"message"`
+		}
+		if jsonLib.Unmarshal(body, &apiErr) == nil && (apiErr.Message != "" || apiErr.Status != 0) {
+			msg := apiErr.Message
+			if msg == "" {
+				msg = fmt.Sprintf("HTTP %d", res.StatusCode)
+			}
+			return nil, errors.Errorf("wolfram alpha API error (HTTP %d): %s", res.StatusCode, msg)
+		}
+		return nil, errors.Errorf("wolfram alpha HTTP %d: %s", res.StatusCode, truncateForErr(string(body), 200))
+	}
 
+	data := &Query{}
 	if err = jsonLib.Unmarshal(body, &data); err != nil {
 		return nil, errors.WithMessage(err, "unable to interpret wolfram alpha json result")
 	}
+	// Detect empty envelope (e.g. unexpected JSON shape).
+	if data.Result.Version == "" && data.Result.NumPods == 0 && !data.Result.Success && data.Result.Error.Err == nil && len(body) > 0 {
+		if !bytes.Contains(body, []byte(`"queryresult"`)) {
+			return nil, errors.Errorf("wolfram alpha response missing queryresult: %s", truncateForErr(string(body), 200))
+		}
+	}
+	data.Result.Query = query
+	return &data.Result, nil
+}
 
-	return &data.Result, err
+func truncateForErr(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // Gets the json from the API and assigns the data to the target.
