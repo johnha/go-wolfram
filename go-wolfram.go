@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -33,7 +32,7 @@ type Query struct {
 	Result QueryResult `json:"queryresult"`
 }
 
-//The QueryResult is what you get back after a request
+// The QueryResult is what you get back after a request
 type QueryResult struct {
 	Query string
 
@@ -148,6 +147,7 @@ type Alternative struct {
 }
 
 // QueryError denotes an error returned by the server.  Note that Wolfram returns a boolean if no error, and a structure
+//
 //	containing description and code if an error.  We therefore need to marshall appropriately.
 type QueryError struct {
 	Err error // nil if no error, a message if error
@@ -213,9 +213,10 @@ type Assumptions struct {
 }
 
 // UnmarshalJSON for assumptions.   Issue with the response from WA in that if a single assumption then an object is returned
-//	containing the single assumption detail.   This appears to be a configuration with Ajax java library.   Questionable design
-//	but we work around by performing the check.
-//  see: https://www.calhoun.io/how-to-parse-json-that-varies-between-an-array-or-a-single-item-with-go/
+//
+//		containing the single assumption detail.   This appears to be a configuration with Ajax java library.   Questionable design
+//		but we work around by performing the check.
+//	 see: https://www.calhoun.io/how-to-parse-json-that-varies-between-an-array-or-a-single-item-with-go/
 func (a *Assumptions) UnmarshalJSON(data []byte) error {
 
 	if len(data) == 0 {
@@ -372,8 +373,8 @@ type Pod struct {
 	// Sounds     Sounds `json:"sounds"`
 }
 
-//If there was a sound related to the query, if you for example query a musical note
-//You will get a <sound> element which contains a link to the sound
+// If there was a sound related to the query, if you for example query a musical note
+// You will get a <sound> element which contains a link to the sound
 type Sounds struct {
 	Count int     `json:"count"`
 	Sound []Sound `json:"sound"`
@@ -409,6 +410,7 @@ type Definition struct {
 }
 
 // UnmarshalJSON is a list of terms useful for interpreting results.  When there is 1 in the list then an object is returned
+//
 //	otherwise a list.   A bespoke unmarshall is therefore required.   This is truelly aweful, and must be a better way
 //	of implementing this (todo)
 func (d *DefinitionList) UnmarshalJSON(data []byte) error {
@@ -440,7 +442,7 @@ func (d *DefinitionList) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-//Each Source contains a link to a web page with the source information
+// Each Source contains a link to a web page with the source information
 type Sources struct {
 	Count  int      `json:"count"`
 	Source []Source `json:"source"`
@@ -452,6 +454,7 @@ type Source struct {
 }
 
 // State denotes a refinement of pod detail.  A query will result in pods that have have more detail (states) that can be
+//
 //	refined.  The 'name' is the button on wolfram alpha.  The 'input' is a non-url encoded value that can be specified as
 //	a podstate prop in additional request (so will need url encoding).
 type State struct {
@@ -471,15 +474,15 @@ type SubPod struct {
 }
 
 /*
-	HTML <img> elements suitable for direct inclusion in a webpage. They point to stored image files giving a formatted visual representation of a single subpod.
-	They only appear in pods if the requested result formats include img. In most cases, the image will be in GIF format, although in a few cases it will be in
-	JPEG format. The filename in the <img> URL will tell you whether it is GIF or JPEG. The <img> tag also contains the following attributes:
+HTML <img> elements suitable for direct inclusion in a webpage. They point to stored image files giving a formatted visual representation of a single subpod.
+They only appear in pods if the requested result formats include img. In most cases, the image will be in GIF format, although in a few cases it will be in
+JPEG format. The filename in the <img> URL will tell you whether it is GIF or JPEG. The <img> tag also contains the following attributes:
 
-	src — The exact URL of the image being displayed, to be used for displaying the image.
-	alt — Alternate text to display in case the image does not render correctly—usually the same as the <plaintext> representation of the image.
-	title — Descriptive title for internal identification of an image—usually the same as the <plaintext> representation of the image.
-	width — The width of the image in pixels; can be changed using the width control parameters.
-	height: — The height of the image in pixels; scales depending on width setting.
+src — The exact URL of the image being displayed, to be used for displaying the image.
+alt — Alternate text to display in case the image does not render correctly—usually the same as the <plaintext> representation of the image.
+title — Descriptive title for internal identification of an image—usually the same as the <plaintext> representation of the image.
+width — The width of the image in pixels; can be changed using the width control parameters.
+height: — The height of the image in pixels; scales depending on width setting.
 */
 type Img struct {
 	Src         string `json:"src"`
@@ -508,15 +511,12 @@ func (c *Client) GetQueryResult(query string, params url.Values) (*QueryResult, 
 	if err != nil {
 		return nil, errors.WithMessage(err, "error in wolfram alpha http request")
 	}
+	defer res.Body.Close()
 
-	body, err := ioutil.ReadAll(res.Body)
+	body, err := io.ReadAll(res.Body)
 	if err != nil {
 		return nil, errors.WithMessage(err, "error in obtaining full wolfram alpha http result")
 	}
-
-	// todo: remove json dump of result
-	jsonResult, _ := PrettyJsonFromRaw((*json.RawMessage)(&body))
-	fmt.Printf("*********\nGetQueryResult JSON\n%s\n", jsonResult)
 
 	data := &Query{}
 	data.Result.Query = query
@@ -537,7 +537,7 @@ func unmarshal(body *http.Response, target interface{}) error {
 
 // GetSimpleQuery gets an image from the `simple` endpoint.
 //
-// Returns the image as a response body, the query url, and an error
+// # Returns the image as a response body, the query url, and an error
 //
 // Can take some extra parameters, e.g `background=F5F5F5`
 // sets the background color to #F5F5F5
@@ -587,7 +587,7 @@ func (c *Client) GetShortAnswerQuery(query string, units Unit, timeout int) (str
 	}
 
 	defer res.Body.Close()
-	b, err := ioutil.ReadAll(res.Body)
+	b, err := io.ReadAll(res.Body)
 	if err != nil {
 		return "", err
 	}
@@ -614,7 +614,7 @@ func (c *Client) GetSpokenAnswerQuery(query string, units Unit, timeout int) (st
 	}
 
 	defer res.Body.Close()
-	b, err := ioutil.ReadAll(res.Body)
+	b, err := io.ReadAll(res.Body)
 	if err != nil {
 		return "", err
 	}
