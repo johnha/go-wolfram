@@ -22,3 +22,8 @@ _testmain.go
 *.exe
 *.test
 *.prof
+/.idea/go.imports.xml
+/.idea/go-wolfram.iml
+/.idea/misc.xml
+/.idea/modules.xml
+/.idea/vcs.xml
